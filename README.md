@@ -51,28 +51,14 @@ the SA's email address as Editor** — same flow as sharing with a teammate.
 The server has to load that JSON file at startup. You have two options — pick
 whichever fits how you already manage secrets.
 
-**Option A — file path on disk** (simplest)
+**Option 1 — 1Pass** 
 
-Put the JSON anywhere readable by the server process and point at it:
-
-```bash
-export SHEETS_SA_JSON_PATH="$HOME/.config/google/sheets-sa.json"
-chmod 600 "$SHEETS_SA_JSON_PATH"
-```
-
-Works the same way if the file is mounted from Google Secret Manager, AWS
-Secrets Manager, HashiCorp Vault, an encrypted volume, or anything else
-that lands a file on disk.
-
-**Option B — 1Password** (what I use)
-
-I prefer not to keep the JSON sitting on disk, so I store it in 1Password
-and let the server fetch it at startup via the
+Storing key in 1Pass allows for easy portability and security. 
 [`@1password/sdk`](https://www.npmjs.com/package/@1password/sdk) package
 (no `op` CLI required).
 
-1. Put the SA JSON in a 1Password item (file attachment or text field).
-2. Create a 1Password **service account** with Read access to that vault.
+1. Put the SA JSON in a 1Pass item (file attachment or text field).
+2. Create a 1Pass **service account** with Read access to that vault.
 3. Configure the env:
 
    ```bash
@@ -87,6 +73,21 @@ and let the server fetch it at startup via the
 
 If both `SHEETS_SA_JSON_PATH` and `SHEETS_SA_OP_REF` are set, the path
 wins.
+
+
+**Option 2 — file path on disk** (simplest)
+
+Put the JSON anywhere readable by the server process and point at it:
+
+```bash
+export SHEETS_SA_JSON_PATH="$HOME/.config/google/sheets-sa.json"
+chmod 600 "$SHEETS_SA_JSON_PATH"
+```
+
+Works the same way if the file is mounted from Google Secret Manager, AWS
+Secrets Manager, HashiCorp Vault, an encrypted volume, or anything else
+that lands a file on disk.
+
 
 ### 3. Build and register
 
