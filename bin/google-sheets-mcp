@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Launcher for the google-sheets-editor MCP server.
+# Token loading and 1Password integration are handled in Node — see
+# src/core/auth.ts. This wrapper exists only so package.json's `bin` field can
+# point at a stable executable.
+set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec node "${SCRIPT_DIR}/../dist/mcp/server.js" "$@"

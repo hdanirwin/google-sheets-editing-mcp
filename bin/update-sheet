@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# CLI wrapper for the google-sheets-editing-mcp update-sheet command.
+# Token loading is handled in Node — see src/core/auth.ts.
+set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec node "${SCRIPT_DIR}/../dist/cli/update-sheet.js" "$@"
