@@ -38,6 +38,83 @@ just manipulate data, but also update spreadsheets as desired.
 | `create_tab` / `rename_tab` / `delete_tab` | Worksheet lifecycle |
 | `batch_update` | Raw Sheets API for formatting, freezes, merges, conditional formatting |
 
+Data tools also accept optional `expectedHeaders` (column drift) and, on the
+range-based tools, `expectedKeys` (row drift) to confirm the layout hasn't
+changed before they act — see
+[Confirming columns haven't changed](#confirming-columns-havent-changed).
+
+## Confirming columns haven't changed
+
+Every data tool (`read_range`, `update_range`, `append_rows`, `clear_range`,
+`replace_tab_with_csv`, `append_csv`, `batch_update`) takes an optional
+`expectedHeaders` argument. When you pass it, the tool reads the actual header
+row **before** acting and compares it to what you expect — so a write that
+assumed last turn's layout can't silently land in the wrong columns.
+
+```jsonc
+{
+  "sheet": "…",
+  "tab": "Accounts",
+  "range": "C2:C500",
+  "values": [["Active"], ["Churned"]],
+  "expectedHeaders": ["Account", "Owner", "Status"]  // what column A→C should be
+}
+```
+
+Three outcomes:
+
+- **Exact match** — the headers are where you expect; the operation proceeds
+  unchanged.
+- **Uniform shift** — the headers are intact but moved by N columns (e.g.
+  someone inserted a column to the left). The operation **proceeds with the
+  target auto-adjusted**: ranges shift by N, appended rows are padded to stay
+  aligned. The response's `columnCheck` reports the offset and the adjusted
+  range.
+- **Anything else** — a header was renamed, deleted, reordered, or the match is
+  ambiguous. The operation **stops** and returns the expected-vs-actual rows so
+  you can re-read the sheet and decide the next step.
+
+Optional companions: `headerRow` (1-based, default 1) if the headers aren't on
+row 1, and `headerStartColumn` (default `A`) if `expectedHeaders` begins
+somewhere other than column A. `batch_update` is verify-only — because raw
+requests target columns by index, even a uniform shift stops the call so you
+can rebuild the requests for the current layout.
+
+### Rows: catching deleted or reordered rows
+
+Columns drift sideways; rows drift up and down. If a row above your target was
+deleted, or rows got reordered between turns, "row 5" now points at a different
+record. The range-based tools (`read_range`, `update_range`, `clear_range`) take
+an optional `expectedKeys` — the row-identity values you expect at the target
+rows — plus `keyColumn`, the column that holds those identities (default `A`):
+
+```jsonc
+{
+  "sheet": "…",
+  "tab": "Accounts",
+  "range": "C5:C7",                       // you think these are rows 5–7
+  "values": [["Active"], ["Churned"], ["Active"]],
+  "keyColumn": "A",                       // the Account-ID column
+  "expectedKeys": ["acme", "beta", "gamma"]  // what column A should read at 5–7
+}
+```
+
+The tool reads `keyColumn`, finds where those keys actually are now, and:
+
+- **Exact** — the keys are at the rows you targeted; proceeds.
+- **Uniform shift** — the keys moved together by N rows (e.g. a row was deleted
+  above, so everything below slid up). The target rows are **auto-adjusted** by N
+  and it proceeds; `rowCheck` reports the offset.
+- **Anything else** — a key is missing (row deleted) or out of order (rows
+  reordered). The operation **stops** and tells you which keys are missing or
+  that the block isn't contiguous, so you can re-read and re-plan.
+
+`expectedKeys` requires a `range` with a concrete start row (e.g. `C5:C7`), since
+that's what anchors the rows. Column and row guards compose: if both drifted, the
+target is shifted on both axes (and the key column is read from its shifted
+position). Each result carries `columnCheck` and/or `rowCheck` describing what
+happened.
+
 ## Setup
 
 ### 1. Google service account
@@ -134,6 +211,39 @@ bin/update-sheet <sheet_url_or_id> <csv_path> [--tab NAME] [--mode replace|appen
 - `replace_tab_with_csv` writes new data **before** clearing trailing rows
   and columns, so a transient failure preserves the original tab rather
   than wiping it.
+
+## Concurrency
+
+Multiple Claude conversations — or any clients sharing the service account — can
+hit the same spreadsheet at once. There is **no locking anywhere in this stack**:
+each conversation runs its own server process, and the server only forwards calls
+to Google. The Sheets API is the sole arbiter. In practice:
+
+- **Reads never conflict.** Any number of readers can read the same tab at once;
+  each gets a consistent snapshot of the moment its request was served. Reads
+  never block reads or writes.
+- **Edits to different tabs are safe.** Different cells, no conflict — both
+  writes land.
+- **Edits to the same range are last-write-wins, silently.** The Sheets values
+  API has no optimistic concurrency (no "write only if unchanged"), so two
+  writers racing the same cells get no conflict error — the later write wins.
+- **Only a single `batch_update` is atomic** (all-or-nothing). No transaction
+  spans multiple calls.
+- **Quota is shared.** All clients on one service account draw the same per-user
+  Sheets quota, so heavy concurrent use can hit `429`. Idempotent ops retry;
+  `append_rows` / `batch_update` don't, surfacing an error rather than risking a
+  duplicate.
+
+### The guard is drift detection, not a lock
+
+`expectedHeaders` / `expectedKeys` read the current layout and *then* write — two
+separate API calls. Another writer can change the sheet in the gap between them,
+so the guard **shrinks** the race window and catches drift that happened *before*
+the call; it does **not** make read-then-write atomic. Use it for "did the layout
+change since I last looked," not for "are two writers racing right now." Any true
+mutual exclusion has to be cooperative and live outside the Sheet — and can only
+bind clients that opt into it (the web UI and other users never will), which is
+exactly why the guard exists alongside it.
 
 ## Tests
 

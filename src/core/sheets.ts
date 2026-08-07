@@ -2,9 +2,72 @@ import type { sheets_v4 } from "googleapis";
 import { initSheetsClient, getServiceAccountEmail } from "./auth.js";
 import { resolveSheetId } from "./ids.js";
 import { readCsvFile } from "./csv.js";
+import {
+  classifyColumns,
+  classifySequence,
+  colLetter,
+  colNumber,
+  shiftColumnsInA1,
+  shiftRowsInA1,
+  type ColumnCheck,
+  type ColumnCheckStatus,
+  type SequenceCheck,
+} from "./columns.js";
+
+// Re-exported so existing importers (and tests) keep finding colLetter here.
+export { colLetter } from "./columns.js";
 
 type ValueInputOption = "USER_ENTERED" | "RAW";
 type ValueRenderOption = "FORMATTED_VALUE" | "UNFORMATTED_VALUE" | "FORMULA";
+
+/** Optional column-drift guard shared by the data tools. */
+export interface ColumnGuardOptions {
+  /**
+   * Header values you expect in the header row, in order, beginning at
+   * `headerStartColumn`. When provided, the tool reads the actual header row
+   * before acting and compares. Omit to skip the check entirely.
+   */
+  expectedHeaders?: string[];
+  /** 1-based row holding the headers. Default: 1. */
+  headerRow?: number;
+  /** Column letter where `expectedHeaders` begins. Default: "A". */
+  headerStartColumn?: string;
+}
+
+/** What the column guard found, attached to a tool's result so the caller sees it. */
+export interface ColumnCheckSummary {
+  status: ColumnCheckStatus;
+  offset: number;
+  expectedHeaders: string[];
+  actualHeaders: string[];
+  adjustedRange?: string;
+  note: string;
+}
+
+/**
+ * Optional row-drift guard. When set, the tool reads the key column before
+ * acting and confirms the target rows still hold the expected keys — catching
+ * rows deleted or reordered since the caller last looked. Only the range-based
+ * tools support it, since the target rows are anchored by the range's start row.
+ */
+export interface RowGuardOptions {
+  /**
+   * Key values you expect at the target rows, in order, starting at the range's
+   * first row. The tool reads `keyColumn` and locates this block. Omit to skip.
+   */
+  expectedKeys?: string[];
+  /** Column letter holding the row identity (id/email/name). Default: "A". */
+  keyColumn?: string;
+}
+
+/** What the row guard found, attached to a tool's result. */
+export interface RowCheckSummary {
+  status: ColumnCheckStatus;
+  offset: number;
+  expectedKeys: string[];
+  adjustedRange?: string;
+  note: string;
+}
 
 export function errorStatus(err: unknown): number | null {
   if (!err || typeof err !== "object") return null;
@@ -108,38 +171,259 @@ export function trailingRanges(
   };
 }
 
-export function colLetter(n: number): string {
-  let s = "";
-  let i = n;
-  while (i > 0) {
-    const r = (i - 1) % 26;
-    s = String.fromCharCode(65 + r) + s;
-    i = Math.floor((i - 1) / 26);
+/** Pull the tab name out of an A1 range that carries a "Tab!..." prefix. */
+function tabFromRange(range: string | undefined): string | undefined {
+  if (!range) return undefined;
+  const bang = range.lastIndexOf("!");
+  if (bang < 0) return undefined;
+  let t = range.slice(0, bang);
+  if (t.startsWith("'") && t.endsWith("'")) {
+    t = t.slice(1, -1).replace(/''/g, "'");
   }
-  return s || "A";
+  return t || undefined;
+}
+
+function columnMismatchMessage(
+  check: ColumnCheck,
+  tab: string,
+  headerRow: number
+): string {
+  return [
+    `Column check stopped the operation: the header row on "${tab}" (row ${headerRow}) no longer matches the expected columns, and the change is more than a simple shift.`,
+    `Expected (starting at column ${colLetter(check.expectedStartColumn)}): ${JSON.stringify(check.expectedHeaders)}`,
+    `Found in that row: ${JSON.stringify(check.actualHeaders)}`,
+    check.reason ? `Reason: ${check.reason}` : "",
+    `Re-read the sheet (get_sheet_info / read_range) and re-plan before writing.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/**
+ * Run the column guard for a data tool. Returns null when no expectedHeaders
+ * were supplied (check skipped). Throws on a mismatch. Otherwise returns the
+ * classification (exact or offset) so the caller can adjust its target.
+ */
+async function runColumnGuard(
+  sheet: string,
+  tab: string | undefined,
+  range: string | undefined,
+  guard: ColumnGuardOptions
+): Promise<ColumnCheck | null> {
+  if (!guard.expectedHeaders || guard.expectedHeaders.length === 0) return null;
+  const headerRow = guard.headerRow ?? 1;
+  const startCol = guard.headerStartColumn ? colNumber(guard.headerStartColumn) : 1;
+  const targetTab =
+    tab ?? tabFromRange(range) ?? (await resolveDefaultTab(sheet));
+  const res = await readRange({
+    sheet,
+    range: `${quoteTab(targetTab)}!${headerRow}:${headerRow}`,
+    valueRenderOption: "FORMATTED_VALUE",
+  });
+  const actualRow = res.values[0] ?? [];
+  const check = classifyColumns(guard.expectedHeaders, actualRow, startCol);
+  if (check.status === "mismatch") {
+    throw new Error(columnMismatchMessage(check, targetTab, headerRow));
+  }
+  return check;
+}
+
+function summarizeCheck(
+  check: ColumnCheck | null,
+  adjustedRange?: string
+): ColumnCheckSummary | undefined {
+  if (!check) return undefined;
+  if (check.status === "exact") {
+    return {
+      status: "exact",
+      offset: 0,
+      expectedHeaders: check.expectedHeaders,
+      actualHeaders: check.actualHeaders,
+      note: "Header row matches the expected columns.",
+    };
+  }
+  const dir = check.offset > 0 ? "right" : "left";
+  return {
+    status: "offset",
+    offset: check.offset,
+    expectedHeaders: check.expectedHeaders,
+    actualHeaders: check.actualHeaders,
+    adjustedRange,
+    note:
+      `Header row is shifted ${Math.abs(check.offset)} column(s) ${dir} from expected; ` +
+      (adjustedRange
+        ? `target auto-adjusted to ${adjustedRange}.`
+        : `target auto-adjusted to compensate.`),
+  };
+}
+
+/** First row number referenced by an A1 range, or null when it has none (e.g. "A:C"). */
+function firstRowOf(range: string | undefined): number | null {
+  if (!range) return null;
+  const bang = range.lastIndexOf("!");
+  const body = bang >= 0 ? range.slice(bang + 1) : range;
+  const m = body.split(":")[0].match(/\d+/);
+  return m ? parseInt(m[0], 10) : null;
+}
+
+function rowMismatchMessage(
+  check: SequenceCheck,
+  tab: string,
+  keyColumn: string
+): string {
+  const present = new Set(check.actual.map((v) => v.trim()));
+  const missing = check.expected.filter((k) => !present.has(k.trim()));
+  return [
+    `Row check stopped the operation: the rows on "${tab}" (keyed by column ${keyColumn}) no longer line up with the expected keys, and the change is more than a simple shift.`,
+    `Expected keys (starting at row ${check.expectedStart}): ${JSON.stringify(check.expected)}`,
+    missing.length
+      ? `Keys not found in column ${keyColumn}: ${JSON.stringify(missing)} — rows may have been deleted.`
+      : `The keys are all present but not as one contiguous block — rows may have been reordered.`,
+    `Re-read column ${keyColumn} and re-plan before writing.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/**
+ * Run the row guard. Returns null when no expectedKeys were supplied. Throws on
+ * a mismatch (deleted/reordered rows). Otherwise returns the classification so
+ * the caller can shift its target rows by the offset. `colOffset` is the column
+ * shift already detected, so the key column is read from its current position.
+ */
+async function runRowGuard(
+  sheet: string,
+  tab: string | undefined,
+  range: string | undefined,
+  colOffset: number,
+  guard: RowGuardOptions
+): Promise<SequenceCheck | null> {
+  if (!guard.expectedKeys || guard.expectedKeys.length === 0) return null;
+  const startRow = firstRowOf(range);
+  if (startRow == null) {
+    throw new Error(
+      "expectedKeys requires a range with a specific start row (e.g. 'B5:D20') so the rows can be anchored."
+    );
+  }
+  let keyCol = guard.keyColumn ?? "A";
+  if (colOffset !== 0) {
+    const shifted = colNumber(keyCol) + colOffset;
+    if (shifted < 1) {
+      throw new Error(
+        `A column shift moves the key column ${keyCol} before column A; re-read the sheet and re-plan.`
+      );
+    }
+    keyCol = colLetter(shifted);
+  }
+  const targetTab =
+    tab ?? tabFromRange(range) ?? (await resolveDefaultTab(sheet));
+  const res = await readRange({
+    sheet,
+    range: `${quoteTab(targetTab)}!${keyCol}:${keyCol}`,
+    valueRenderOption: "FORMATTED_VALUE",
+  });
+  const actualColumn = res.values.map((r) => r[0] ?? "");
+  const check = classifySequence(guard.expectedKeys, actualColumn, startRow);
+  if (check.status === "mismatch") {
+    throw new Error(rowMismatchMessage(check, targetTab, keyCol));
+  }
+  return check;
+}
+
+function summarizeRowCheck(
+  check: SequenceCheck | null,
+  adjustedRange?: string
+): RowCheckSummary | undefined {
+  if (!check) return undefined;
+  if (check.status === "exact") {
+    return {
+      status: "exact",
+      offset: 0,
+      expectedKeys: check.expected,
+      note: "Target rows match the expected keys.",
+    };
+  }
+  const dir = check.offset > 0 ? "down" : "up";
+  return {
+    status: "offset",
+    offset: check.offset,
+    expectedKeys: check.expected,
+    adjustedRange,
+    note:
+      `Target rows are shifted ${Math.abs(check.offset)} row(s) ${dir} from expected ` +
+      `(rows likely ${check.offset > 0 ? "added" : "removed"} above); ` +
+      (adjustedRange
+        ? `target auto-adjusted to ${adjustedRange}.`
+        : `target auto-adjusted to compensate.`),
+  };
+}
+
+/**
+ * Run both guards for a range-based tool and return the effective range with any
+ * column and row offsets applied. Throws on a mismatch in either dimension.
+ */
+async function resolveTarget(
+  opts: {
+    sheet: string;
+    tab?: string;
+    range?: string;
+  } & ColumnGuardOptions &
+    RowGuardOptions
+): Promise<{
+  colCheck: ColumnCheck | null;
+  rowCheck: SequenceCheck | null;
+  range: string | undefined;
+}> {
+  const colCheck = await runColumnGuard(opts.sheet, opts.tab, opts.range, opts);
+  const rowCheck = await runRowGuard(
+    opts.sheet,
+    opts.tab,
+    opts.range,
+    colCheck?.offset ?? 0,
+    opts
+  );
+  let range = opts.range;
+  if (range && colCheck && colCheck.offset !== 0) {
+    range = shiftColumnsInA1(range, colCheck.offset);
+  }
+  if (range && rowCheck && rowCheck.offset !== 0) {
+    range = shiftRowsInA1(range, rowCheck.offset);
+  }
+  return { colCheck, rowCheck, range };
 }
 
 export interface ReadRangeResult {
   range: string;
   values: string[][];
+  columnCheck?: ColumnCheckSummary;
+  rowCheck?: RowCheckSummary;
 }
 
-export async function readRange(opts: {
-  sheet: string;
-  tab?: string;
-  range?: string;
-  valueRenderOption?: ValueRenderOption;
-}): Promise<ReadRangeResult> {
+export async function readRange(
+  opts: {
+    sheet: string;
+    tab?: string;
+    range?: string;
+    valueRenderOption?: ValueRenderOption;
+  } & ColumnGuardOptions &
+    RowGuardOptions
+): Promise<ReadRangeResult> {
+  // resolveTarget short-circuits when neither expectedHeaders nor expectedKeys
+  // is set, so the guards' own internal reads don't recurse back through here.
+  const { colCheck, rowCheck, range } = await resolveTarget(opts);
+  const adjusted = range !== opts.range ? range : undefined;
   return withSheet(opts.sheet, async (sheets, spreadsheetId) => {
     try {
       const res = await sheets.spreadsheets.values.get({
         spreadsheetId,
-        range: rangeFor(opts.tab, opts.range),
+        range: rangeFor(opts.tab, range),
         valueRenderOption: opts.valueRenderOption ?? "FORMATTED_VALUE",
       });
       return {
         range: res.data.range ?? "",
         values: (res.data.values as string[][]) ?? [],
+        columnCheck: summarizeCheck(colCheck, colCheck?.offset ? adjusted : undefined),
+        rowCheck: summarizeRowCheck(rowCheck, rowCheck?.offset ? adjusted : undefined),
       };
     } catch (err) {
       throw wrapError("read_range", err);
@@ -152,20 +436,27 @@ export interface UpdateRangeResult {
   updatedRows: number;
   updatedColumns: number;
   updatedCells: number;
+  columnCheck?: ColumnCheckSummary;
+  rowCheck?: RowCheckSummary;
 }
 
-export async function updateRange(opts: {
-  sheet: string;
-  tab?: string;
-  range: string;
-  values: (string | number | boolean | null)[][];
-  valueInputOption?: ValueInputOption;
-}): Promise<UpdateRangeResult> {
+export async function updateRange(
+  opts: {
+    sheet: string;
+    tab?: string;
+    range: string;
+    values: (string | number | boolean | null)[][];
+    valueInputOption?: ValueInputOption;
+  } & ColumnGuardOptions &
+    RowGuardOptions
+): Promise<UpdateRangeResult> {
+  const { colCheck, rowCheck, range } = await resolveTarget(opts);
+  const adjusted = range !== opts.range ? range : undefined;
   return withSheet(opts.sheet, async (sheets, spreadsheetId) => {
     try {
       const res = await sheets.spreadsheets.values.update({
         spreadsheetId,
-        range: rangeFor(opts.tab, opts.range),
+        range: rangeFor(opts.tab, range),
         valueInputOption: opts.valueInputOption ?? "USER_ENTERED",
         requestBody: { values: opts.values as unknown[][] },
       });
@@ -174,6 +465,8 @@ export async function updateRange(opts: {
         updatedRows: res.data.updatedRows ?? 0,
         updatedColumns: res.data.updatedColumns ?? 0,
         updatedCells: res.data.updatedCells ?? 0,
+        columnCheck: summarizeCheck(colCheck, colCheck?.offset ? adjusted : undefined),
+        rowCheck: summarizeRowCheck(rowCheck, rowCheck?.offset ? adjusted : undefined),
       };
     } catch (err) {
       throw wrapError("update_range", err);
@@ -184,14 +477,30 @@ export async function updateRange(opts: {
 export interface AppendRowsResult {
   updatedRange: string;
   updatedRows: number;
+  columnCheck?: ColumnCheckSummary;
 }
 
-export async function appendRows(opts: {
-  sheet: string;
-  tab: string;
-  values: (string | number | boolean | null)[][];
-  valueInputOption?: ValueInputOption;
-}): Promise<AppendRowsResult> {
+export async function appendRows(
+  opts: {
+    sheet: string;
+    tab: string;
+    values: (string | number | boolean | null)[][];
+    valueInputOption?: ValueInputOption;
+  } & ColumnGuardOptions
+): Promise<AppendRowsResult> {
+  const check = await runColumnGuard(opts.sheet, opts.tab, undefined, opts);
+  // Append always starts at column A, so a rightward shift is compensated by
+  // padding each row with leading blanks. A leftward shift can't be expressed
+  // without dropping data, so stop and let the caller re-plan.
+  let values = opts.values;
+  if (check && check.offset > 0) {
+    const pad = new Array(check.offset).fill(null);
+    values = opts.values.map((row) => [...pad, ...row]);
+  } else if (check && check.offset < 0) {
+    throw new Error(
+      `Column check stopped append: the header row is shifted ${Math.abs(check.offset)} column(s) left of expected, which append cannot compensate for without dropping data. Re-read the sheet and re-plan.`
+    );
+  }
   return withSheet(opts.sheet, async (sheets, spreadsheetId) => {
     try {
       const res = await sheets.spreadsheets.values.append({
@@ -199,11 +508,12 @@ export async function appendRows(opts: {
         range: quoteTab(opts.tab),
         valueInputOption: opts.valueInputOption ?? "USER_ENTERED",
         insertDataOption: "INSERT_ROWS",
-        requestBody: { values: opts.values as unknown[][] },
+        requestBody: { values: values as unknown[][] },
       });
       return {
         updatedRange: res.data.updates?.updatedRange ?? "",
         updatedRows: res.data.updates?.updatedRows ?? 0,
+        columnCheck: summarizeCheck(check),
       };
     } catch (err) {
       throw wrapError("append_rows", err);
@@ -213,20 +523,31 @@ export async function appendRows(opts: {
 
 export interface ClearRangeResult {
   clearedRange: string;
+  columnCheck?: ColumnCheckSummary;
+  rowCheck?: RowCheckSummary;
 }
 
-export async function clearRange(opts: {
-  sheet: string;
-  tab?: string;
-  range?: string;
-}): Promise<ClearRangeResult> {
+export async function clearRange(
+  opts: {
+    sheet: string;
+    tab?: string;
+    range?: string;
+  } & ColumnGuardOptions &
+    RowGuardOptions
+): Promise<ClearRangeResult> {
+  const { colCheck, rowCheck, range } = await resolveTarget(opts);
+  const adjusted = range !== opts.range ? range : undefined;
   return withSheet(opts.sheet, async (sheets, spreadsheetId) => {
     try {
       const res = await sheets.spreadsheets.values.clear({
         spreadsheetId,
-        range: rangeFor(opts.tab, opts.range),
+        range: rangeFor(opts.tab, range),
       });
-      return { clearedRange: res.data.clearedRange ?? "" };
+      return {
+        clearedRange: res.data.clearedRange ?? "",
+        columnCheck: summarizeCheck(colCheck, colCheck?.offset ? adjusted : undefined),
+        rowCheck: summarizeRowCheck(rowCheck, rowCheck?.offset ? adjusted : undefined),
+      };
     } catch (err) {
       throw wrapError("clear_range", err);
     }
@@ -342,6 +663,7 @@ export interface CsvReplaceResult {
   tab: string;
   rows: number;
   columns: number;
+  columnCheck?: ColumnCheckSummary;
 }
 
 async function resolveDefaultTab(sheet: string): Promise<string> {
@@ -351,16 +673,22 @@ async function resolveDefaultTab(sheet: string): Promise<string> {
   return first;
 }
 
-export async function replaceTabWithCsv(opts: {
-  sheet: string;
-  csvPath: string;
-  tab?: string;
-}): Promise<CsvReplaceResult> {
+export async function replaceTabWithCsv(
+  opts: {
+    sheet: string;
+    csvPath: string;
+    tab?: string;
+  } & ColumnGuardOptions
+): Promise<CsvReplaceResult> {
   const rows = await readCsvFile(opts.csvPath);
   if (!rows.length) throw new Error("CSV is empty.");
   const csvRows = rows.length;
   const csvCols = Math.max(...rows.map((r) => r.length), 0);
   const targetTab = opts.tab ?? (await resolveDefaultTab(opts.sheet));
+
+  // Verify we're overwriting the tab/layout we think we are. A full-tab rewrite
+  // starts at A1, so an offset can't be auto-adjusted — it's reported, not applied.
+  const check = await runColumnGuard(opts.sheet, targetTab, undefined, opts);
 
   return withSheet(opts.sheet, async (sheets, spreadsheetId) => {
     try {
@@ -378,7 +706,12 @@ export async function replaceTabWithCsv(opts: {
         spreadsheetId,
         requestBody: { ranges: [trailing.rows, trailing.cols] },
       });
-      return { tab: targetTab, rows: csvRows, columns: csvCols };
+      return {
+        tab: targetTab,
+        rows: csvRows,
+        columns: csvCols,
+        columnCheck: summarizeCheck(check),
+      };
     } catch (err) {
       throw wrapError("replace_tab_with_csv", err);
     }
@@ -388,14 +721,17 @@ export async function replaceTabWithCsv(opts: {
 export interface CsvAppendResult {
   tab: string;
   appendedRows: number;
+  columnCheck?: ColumnCheckSummary;
 }
 
-export async function appendCsv(opts: {
-  sheet: string;
-  csvPath: string;
-  tab?: string;
-  includeHeader?: boolean;
-}): Promise<CsvAppendResult> {
+export async function appendCsv(
+  opts: {
+    sheet: string;
+    csvPath: string;
+    tab?: string;
+    includeHeader?: boolean;
+  } & ColumnGuardOptions
+): Promise<CsvAppendResult> {
   const rows = await readCsvFile(opts.csvPath);
   const body = opts.includeHeader ? rows : rows.slice(1);
   if (!body.length) {
@@ -407,18 +743,38 @@ export async function appendCsv(opts: {
   }
 
   const targetTab = opts.tab ?? (await resolveDefaultTab(opts.sheet));
+  // The guard runs inside appendRows (which also applies any offset padding).
   const result = await appendRows({
     sheet: opts.sheet,
     tab: targetTab,
     values: body,
+    expectedHeaders: opts.expectedHeaders,
+    headerRow: opts.headerRow,
+    headerStartColumn: opts.headerStartColumn,
   });
-  return { tab: targetTab, appendedRows: result.updatedRows };
+  return {
+    tab: targetTab,
+    appendedRows: result.updatedRows,
+    columnCheck: result.columnCheck,
+  };
 }
 
-export async function batchUpdate(opts: {
-  sheet: string;
-  requests: sheets_v4.Schema$Request[];
-}): Promise<sheets_v4.Schema$BatchUpdateSpreadsheetResponse> {
+export async function batchUpdate(
+  opts: {
+    sheet: string;
+    requests: sheets_v4.Schema$Request[];
+    /** Tab whose header row to confirm when expectedHeaders is set. */
+    tab?: string;
+  } & ColumnGuardOptions
+): Promise<sheets_v4.Schema$BatchUpdateSpreadsheetResponse> {
+  // Raw requests reference columns by index, so an offset can't be safely
+  // auto-applied here — verify only, and stop on any drift (incl. a shift).
+  const check = await runColumnGuard(opts.sheet, opts.tab, undefined, opts);
+  if (check && check.offset !== 0) {
+    throw new Error(
+      `Column check stopped batch_update: the header row is shifted ${Math.abs(check.offset)} column(s) from expected. Raw batch requests target columns by index and can't be auto-adjusted — re-read the sheet and rebuild the requests for the current layout.`
+    );
+  }
   return withSheet(opts.sheet, async (sheets, spreadsheetId) => {
     try {
       const res = await sheets.spreadsheets.batchUpdate({

@@ -11,6 +11,13 @@ import {
 } from "../dist/core/sheets.js";
 import { resolveSheetId } from "../dist/core/ids.js";
 import { parseCsv } from "../dist/core/csv.js";
+import {
+  classifyColumns,
+  classifySequence,
+  colNumber,
+  shiftColumnsInA1,
+  shiftRowsInA1,
+} from "../dist/core/columns.js";
 
 test("colLetter: single-letter columns", () => {
   assert.equal(colLetter(1), "A");
@@ -163,4 +170,153 @@ test("trailingRanges: quotes tabs with spaces", () => {
     rows: "'My Tab'!A2:ZZZ",
     cols: "'My Tab'!B1:ZZZ1",
   });
+});
+
+test("colNumber: inverts colLetter", () => {
+  assert.equal(colNumber("A"), 1);
+  assert.equal(colNumber("Z"), 26);
+  assert.equal(colNumber("AA"), 27);
+  assert.equal(colNumber("ZZ"), 702);
+  assert.equal(colNumber("aa"), 27); // case-insensitive
+});
+
+test("colNumber: non-letters return 0", () => {
+  assert.equal(colNumber(""), 0);
+  assert.equal(colNumber("A1"), 0);
+  assert.equal(colNumber("1"), 0);
+});
+
+test("classifyColumns: exact match at expected start", () => {
+  const r = classifyColumns(["Name", "Email", "Status"], ["Name", "Email", "Status"]);
+  assert.equal(r.status, "exact");
+  assert.equal(r.offset, 0);
+});
+
+test("classifyColumns: trims whitespace before comparing", () => {
+  const r = classifyColumns(["Name", "Status"], ["Name ", " Status"]);
+  assert.equal(r.status, "exact");
+});
+
+test("classifyColumns: empty expected is a no-op match", () => {
+  const r = classifyColumns([], ["whatever"]);
+  assert.equal(r.status, "exact");
+  assert.equal(r.offset, 0);
+});
+
+test("classifyColumns: detects a uniform rightward shift", () => {
+  // A column was inserted at the front, so the block moved one column right.
+  const r = classifyColumns(["Name", "Email"], ["New", "Name", "Email"]);
+  assert.equal(r.status, "offset");
+  assert.equal(r.offset, 1);
+  assert.equal(r.matchedStartColumn, 2);
+});
+
+test("classifyColumns: honors a non-default expected start column", () => {
+  // Headers expected to start at column C (3); found starting at column D (4).
+  const r = classifyColumns(["X", "Y"], ["", "", "", "X", "Y"], 3);
+  assert.equal(r.status, "offset");
+  assert.equal(r.offset, 1);
+});
+
+test("classifyColumns: a rename is a mismatch, not a shift", () => {
+  const r = classifyColumns(["Name", "Email"], ["Name", "E-mail"]);
+  assert.equal(r.status, "mismatch");
+  assert.ok(r.reason);
+});
+
+test("classifyColumns: missing block is a mismatch", () => {
+  const r = classifyColumns(["Name", "Email"], ["Region", "Owner"]);
+  assert.equal(r.status, "mismatch");
+});
+
+test("classifyColumns: a block present at the expected start wins over duplicates", () => {
+  // "X" sits exactly where expected (col A) AND repeats later — still exact.
+  const r = classifyColumns(["X"], ["X", "Y", "X"]);
+  assert.equal(r.status, "exact");
+});
+
+test("classifyColumns: ambiguous shift (not at expected start) is a mismatch", () => {
+  // Expected at col A, but "X" appears only at cols B and D → can't pick a shift.
+  const r = classifyColumns(["X"], ["Y", "X", "Z", "X"]);
+  assert.equal(r.status, "mismatch");
+  assert.ok(r.reason);
+});
+
+test("shiftColumnsInA1: shifts a cell range, leaves rows alone", () => {
+  assert.equal(shiftColumnsInA1("A1:C10", 1), "B1:D10");
+  assert.equal(shiftColumnsInA1("B2:D5", 2), "D2:F5");
+});
+
+test("shiftColumnsInA1: shifts full-column ranges", () => {
+  assert.equal(shiftColumnsInA1("A:C", 1), "B:D");
+});
+
+test("shiftColumnsInA1: preserves a tab prefix", () => {
+  assert.equal(shiftColumnsInA1("'My Tab'!A1:B2", 1), "'My Tab'!B1:C2");
+  assert.equal(shiftColumnsInA1("Sheet1!C3", 3), "Sheet1!F3");
+});
+
+test("shiftColumnsInA1: offset 0 is a no-op", () => {
+  assert.equal(shiftColumnsInA1("A1:C10", 0), "A1:C10");
+});
+
+test("shiftColumnsInA1: shifting before column A throws", () => {
+  assert.throws(() => shiftColumnsInA1("A1:C10", -1), /before column A/);
+});
+
+// --- Row drift: classifySequence reused for key columns ---
+
+test("classifySequence: key column exact at expected start row", () => {
+  // Keys expected at rows 2-4; key column is [header, a, b, c] → indices 0..3.
+  const r = classifySequence(["a", "b", "c"], ["Key", "a", "b", "c"], 2);
+  assert.equal(r.status, "exact");
+  assert.equal(r.offset, 0);
+});
+
+test("classifySequence: rows deleted above → upward offset", () => {
+  // Expected keys at rows 5-6, but two rows above were deleted → now rows 3-4.
+  const r = classifySequence(["acme", "beta"], ["Key", "x", "acme", "beta"], 5);
+  assert.equal(r.status, "offset");
+  assert.equal(r.offset, -2); // moved up two rows
+  assert.equal(r.matchedStart, 3);
+});
+
+test("classifySequence: rows inserted above → downward offset", () => {
+  const r = classifySequence(["acme"], ["Key", "acme"], 1);
+  assert.equal(r.status, "offset");
+  assert.equal(r.offset, 1);
+});
+
+test("classifySequence: a deleted target row is a mismatch", () => {
+  // Expected acme,beta,gamma but beta is gone → not contiguous.
+  const r = classifySequence(["acme", "beta", "gamma"], ["acme", "gamma"], 1);
+  assert.equal(r.status, "mismatch");
+});
+
+test("classifySequence: reordered rows are a mismatch", () => {
+  const r = classifySequence(["acme", "beta"], ["beta", "acme"], 1);
+  assert.equal(r.status, "mismatch");
+});
+
+test("shiftRowsInA1: shifts rows, leaves columns alone", () => {
+  assert.equal(shiftRowsInA1("B5:D20", 2), "B7:D22");
+  assert.equal(shiftRowsInA1("B5:D20", -2), "B3:D18");
+});
+
+test("shiftRowsInA1: shifts full-row ranges", () => {
+  assert.equal(shiftRowsInA1("5:8", 1), "6:9");
+});
+
+test("shiftRowsInA1: preserves a tab prefix with digits", () => {
+  // The "1" in "Sheet1" must not be shifted — only the body after "!".
+  assert.equal(shiftRowsInA1("Sheet1!A5:B6", 1), "Sheet1!A6:B7");
+  assert.equal(shiftRowsInA1("'2024 Data'!C3", 2), "'2024 Data'!C5");
+});
+
+test("shiftRowsInA1: offset 0 is a no-op", () => {
+  assert.equal(shiftRowsInA1("B5:D20", 0), "B5:D20");
+});
+
+test("shiftRowsInA1: shifting above row 1 throws", () => {
+  assert.throws(() => shiftRowsInA1("A2:B3", -5), /above row 1/);
 });
